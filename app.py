@@ -1,26 +1,9 @@
 """
-Toll Traffic & Revenue Prediction App (improved, XGBoost + TimeSeries features)
+Toll Traffic & Revenue Prediction App (fixed for pandas newer versions)
 
-How to use:
-- pip install -r requirements.txt
-- streamlit run app.py
-- Upload your CSV / Excel containing Somatne Phata data with columns:
-    Date,
-    Car/Jeep Count,
-    Total Car/Jeep Amount (Rs),
-    Bus/Truck Count,
-    Total Bus/Truck Amount (Rs),
-    LCV Count,
-    Total LCV Amount (Rs),
-    MAV Count,
-    Total MAV Amount (Rs)
-
-App will:
-- Preprocess & engineer features (lags, rolling means, dow, weekend, month, dayofyear)
-- Train two XGBoost regressors (traffic & revenue) with TimeSeriesSplit CV
-- Show CV metrics and feature importance
-- Save models to disk (traffic_model.pkl, revenue_model.pkl)
-- Provide next-N-days predictions using last known observations
+This is the same improved app as before but with DataFrame.append replaced
+with pd.concat and safer updates so it runs on pandas versions where
+DataFrame.append has been removed.
 """
 
 import streamlit as st
@@ -47,14 +30,6 @@ def safe_to_int(x):
         return np.nan
 
 def preprocess(df):
-    """
-    Input: raw df with Date and the vehicle counts/amount columns
-    Output: cleaned df with features and target columns:
-      - Total_Vehicles, Total_Revenue
-      - DayOfWeek, IsWeekend, Month, DayOfYear
-      - Lags: lag_1, lag_7
-      - Rolling mean: rm_7
-    """
     df = df.copy()
     # Standardize column names (common variants)
     col_map = {}
@@ -80,49 +55,41 @@ def preprocess(df):
             col_map[c] = "Total MAV Amount (Rs)"
     df = df.rename(columns=col_map)
 
-    # Ensure required columns exist; try to infer otherwise
     required_counts = [
         "Car/Jeep Count", "Bus/Truck Count", "LCV Count", "MAV Count",
         "Total Car/Jeep Amount (Rs)", "Total Bus/Truck Amount (Rs)",
         "Total LCV Amount (Rs)", "Total MAV Amount (Rs)"
     ]
-    # Convert numeric-like columns
     for c in df.columns:
         if c != "Date":
             df[c] = df[c].apply(lambda x: safe_to_int(x) if pd.notna(x) else np.nan)
 
-    # Date
     df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
     df = df.dropna(subset=['Date']).sort_values('Date').reset_index(drop=True)
 
-    # If any count columns missing, fill zeros (best-effort)
     for rc in required_counts:
         if rc not in df.columns:
             df[rc] = 0
 
-    # Targets
     df['Total_Vehicles'] = df['Car/Jeep Count'].fillna(0) + df['Bus/Truck Count'].fillna(0) + df['LCV Count'].fillna(0) + df['MAV Count'].fillna(0)
     df['Total_Revenue'] = df['Total Car/Jeep Amount (Rs)'].fillna(0) + df['Total Bus/Truck Amount (Rs)'].fillna(0) + df['Total LCV Amount (Rs)'].fillna(0) + df['Total MAV Amount (Rs)'].fillna(0)
 
-    # Basic calendar features
-    df['DayOfWeek'] = df['Date'].dt.dayofweek  # 0 Monday
+    df['DayOfWeek'] = df['Date'].dt.dayofweek
     df['IsWeekend'] = df['DayOfWeek'].isin([5,6]).astype(int)
     df['Month'] = df['Date'].dt.month
     df['DayOfYear'] = df['Date'].dt.dayofyear
 
-    # Lags & rolling features on Total_Vehicles and Total_Revenue
     for lag in (1,7):
         df[f'lag_v_{lag}'] = df['Total_Vehicles'].shift(lag)
         df[f'lag_r_{lag}'] = df['Total_Revenue'].shift(lag)
-    df['rm7_v'] = df['Total_Vehicles'].rolling(window=7, min_periods=1).mean().shift(1)  # previous 7-day mean
+    df['rm7_v'] = df['Total_Vehicles'].rolling(window=7, min_periods=1).mean().shift(1)
     df['rm7_r'] = df['Total_Revenue'].rolling(window=7, min_periods=1).mean().shift(1)
 
-    # Drop rows with NA in lags (we'll keep only rows with enough lag history)
     df = df.dropna(subset=['lag_v_1','lag_v_7','rm7_v','lag_r_1','lag_r_7','rm7_r']).reset_index(drop=True)
 
     return df
 
-def time_series_cv_eval(X, y, model, n_splits=5, scoring=None):
+def time_series_cv_eval(X, y, model, n_splits=5):
     tscv = TimeSeriesSplit(n_splits=n_splits)
     maes = []
     r2s = []
@@ -132,7 +99,7 @@ def time_series_cv_eval(X, y, model, n_splits=5, scoring=None):
         fold += 1
         X_train, X_test = X.iloc[train_index], X.iloc[test_index]
         y_train, y_test = y.iloc[train_index], y.iloc[test_index]
-        m = model if fold>1 else model  # same model class used repeatedly
+        m = model
         m.fit(X_train, y_train)
         y_hat = m.predict(X_test)
         preds[test_index] = y_hat
@@ -156,29 +123,24 @@ def train_xgb_with_cv(X, y, param_search=False, random_state=42):
     else:
         best = XGBRegressor(objective='reg:squarederror', n_estimators=300, learning_rate=0.05, max_depth=6, random_state=random_state, n_jobs=-1)
         best.fit(X, y)
-    # Evaluate with TimeSeriesSplit for reliable estimate
     cv_res = time_series_cv_eval(X, y, best, n_splits=5)
     return best, cv_res
 
 def make_future_input(history_df, n_days):
     """
-    Create future rows for next n_days using simple recursive approach:
-    - Use last observed timestamp
-    - For each next day, compute features using previous predicted values for lags/rm7
-    This is a pragmatic approach; more advanced approaches (ARIMA, ETS, Prophet) are possible.
+    Create future rows for next n_days using recursive approach but without using DataFrame.append
     """
     hist = history_df.copy().sort_values('Date').reset_index(drop=True)
     last_date = hist['Date'].max()
     rows = []
-    # we need the last 7 days to compute rolling
-    temp = hist.copy()
+    temp = hist.copy()  # used to compute lags/rolling
     for i in range(1, n_days+1):
         dt = last_date + timedelta(days=i)
         dayofweek = dt.dayofweek
         isweekend = 1 if dayofweek in (5,6) else 0
         month = dt.month
         dayofyear = dt.timetuple().tm_yday
-        # lags: lag1 = last total_vehicles (either observed or predicted), lag7 = value 7 days back (from temp)
+
         lag_v_1 = temp.iloc[-1]['Total_Vehicles']
         lag_r_1 = temp.iloc[-1]['Total_Revenue']
         lag_v_7 = temp.iloc[-7]['Total_Vehicles'] if len(temp) >= 7 else temp['Total_Vehicles'].iloc[0]
@@ -201,8 +163,9 @@ def make_future_input(history_df, n_days):
         }
         rows.append(row)
 
-        # append placeholders for Total_Vehicles/Total_Revenue (0) — actual prediction step filled later
-        temp = temp.append({'Date':dt,'Total_Vehicles':lag_v_1,'Total_Revenue':lag_r_1}, ignore_index=True)
+        # Instead of append(), use pd.concat to add a small dataframe row to temp.
+        new_row_df = pd.DataFrame([{'Date': dt, 'Total_Vehicles': lag_v_1, 'Total_Revenue': lag_r_1}])
+        temp = pd.concat([temp, new_row_df], ignore_index=True)
 
     fut_df = pd.DataFrame(rows)
     return fut_df
@@ -210,7 +173,7 @@ def make_future_input(history_df, n_days):
 # --------------------------
 # Streamlit UI
 # --------------------------
-st.title("🚦 Somatne Phata — Traffic & Revenue Forecast (Accurate version)")
+st.title("🚦 Somatne Phata — Traffic & Revenue Forecast (Fixed)")
 
 uploaded_file = st.file_uploader("Upload your CSV / Excel (Somatne Phata data)", type=['csv','xlsx','xls'])
 use_example = st.checkbox("Use example (if you don't upload)", value=False)
@@ -219,7 +182,6 @@ if uploaded_file is None and not use_example:
     st.info("Upload CSV/Excel with Date and toll columns, or tick 'Use example' to try demo data.")
     st.stop()
 
-# Load
 if uploaded_file is not None:
     try:
         if uploaded_file.name.endswith('.csv'):
@@ -230,7 +192,6 @@ if uploaded_file is not None:
         st.error(f"Could not read file: {e}")
         st.stop()
 else:
-    # Small synthetic example (for demo only)
     dates = pd.date_range(start="2025-01-01", periods=120)
     np.random.seed(42)
     raw = pd.DataFrame({
@@ -240,7 +201,7 @@ else:
         "LCV Count": (600 + np.random.randint(-200,200,len(dates))).astype(int),
         "MAV Count": (1800 + np.random.randint(-400,400,len(dates))).astype(int),
     })
-    raw["Total Car/Jeep Amount (Rs)"] = raw["Car/Jeep Count"] * 40  # example rates
+    raw["Total Car/Jeep Amount (Rs)"] = raw["Car/Jeep Count"] * 40
     raw["Total Bus/Truck Amount (Rs)"] = raw["Bus/Truck Count"] * 150
     raw["Total LCV Amount (Rs)"] = raw["LCV Count"] * 80
     raw["Total MAV Amount (Rs)"] = raw["MAV Count"] * 350
@@ -248,13 +209,11 @@ else:
 st.subheader("Raw data preview")
 st.write(raw.head())
 
-# Preprocess + feature engineering
 with st.spinner("Preprocessing & feature engineering..."):
     df = preprocess(raw)
 
 st.success(f"Preprocessing done — {len(df)} usable rows after lag/rolling features.")
 
-# Show trend charts
 st.subheader("Traffic & Revenue trend (input data)")
 c1, c2 = st.columns(2)
 with c1:
@@ -262,13 +221,11 @@ with c1:
 with c2:
     st.line_chart(df.set_index('Date')['Total_Revenue'])
 
-# Prepare features for model
 feature_cols = ['DayOfWeek','IsWeekend','Month','DayOfYear','lag_v_1','lag_v_7','rm7_v','lag_r_1','lag_r_7','rm7_r']
 X = df[feature_cols]
 y_v = df['Total_Vehicles']
 y_r = df['Total_Revenue']
 
-# Train models
 st.subheader("Model training (XGBoost)")
 
 param_search = st.checkbox("Perform hyperparameter randomized search (slower)", value=False)
@@ -278,7 +235,6 @@ if st.button("Train models now"):
     with st.spinner("Training revenue model..."):
         revenue_model, revenue_cv = train_xgb_with_cv(X, y_r, param_search=param_search)
 
-    # Save models
     model_dir = Path("models")
     model_dir.mkdir(exist_ok=True)
     joblib.dump(traffic_model, model_dir / "traffic_model.pkl")
@@ -290,7 +246,6 @@ if st.button("Train models now"):
     st.write("Revenue CV MAE (mean ± std):", f"{revenue_cv['mae_mean']:.2f} ± {revenue_cv['mae_std']:.2f}")
     st.write("Revenue CV R2 mean:", f"{revenue_cv['r2_mean']:.3f}")
 
-    # Feature importance (from XGBoost)
     st.subheader("Feature importance — Traffic model")
     try:
         fi = pd.Series(traffic_model.feature_importances_, index=feature_cols).sort_values(ascending=False)
@@ -305,7 +260,6 @@ if st.button("Train models now"):
     except Exception:
         st.info("Could not compute feature importance for revenue model.")
 
-    # Show last actual vs predicted on holdout (last 14 days)
     st.subheader("Backtest (last 14 days)")
     preds_v = traffic_model.predict(X)
     preds_r = revenue_model.predict(X)
@@ -316,7 +270,6 @@ if st.button("Train models now"):
     st.line_chart(backtest.set_index('Date')[['Total_Vehicles','pred_v']])
     st.line_chart(backtest.set_index('Date')[['Total_Revenue','pred_r']])
 
-# If models already exist, load them
 model_dir = Path("models")
 traffic_model = None
 revenue_model = None
@@ -328,7 +281,6 @@ if (model_dir / "traffic_model.pkl").exists() and (model_dir / "revenue_model.pk
         traffic_model = None
         revenue_model = None
 
-# Predictions UI
 st.subheader("Predict next N days")
 n_days = st.number_input("Number of days to forecast", min_value=1, max_value=90, value=7)
 if st.button("Forecast next days"):
@@ -336,41 +288,46 @@ if st.button("Forecast next days"):
         st.error("Models not found. Train models first (click 'Train models now').")
     else:
         future_input = make_future_input(df, n_days)
-        # ensure columns in same order
         X_future = future_input[feature_cols].copy()
-        # Note: make_future_input filled lag placeholders by repeating last observed values.
-        # For more robust forecasting, you can iteratively update predictions into lags (we'll do one-pass iterative)
+        # iterative prediction while updating next-day lags using pd.concat for safety
         fut_preds_v = []
         fut_preds_r = []
         temp_df = df.copy()
-        for idx, row in X_future.iterrows():
-            xrow = row.values.reshape(1,-1)
-            pred_v = traffic_model.predict(xrow)[0]
-            pred_r = revenue_model.predict(xrow)[0]
+        # ensure X_future index alignment
+        X_future = X_future.reset_index(drop=True)
+        for idx in range(len(X_future)):
+            row = X_future.iloc[idx:idx+1]
+            pred_v = int(round(traffic_model.predict(row)[0]))
+            pred_r = int(round(revenue_model.predict(row)[0]))
             fut_preds_v.append(pred_v)
             fut_preds_r.append(pred_r)
-            # append predicted values to temp_df to update next day's lags/rolling
-            temp_df = temp_df.append({'Date': row['Date'] if 'Date' in row.index else (df['Date'].max()+pd.Timedelta(days=idx+1)),
-                                      'Total_Vehicles': pred_v, 'Total_Revenue': pred_r}, ignore_index=True)
-            # update X_future subsequent rows lags (simple iterative update)
-            # If there are next rows, update their lag_v_1/lag_r_1 and rm7 using temp_df
+            # append predicted row to temp_df using pd.concat
+            new_row_df = pd.DataFrame([{'Date': future_input['Date'].iloc[idx], 'Total_Vehicles': pred_v, 'Total_Revenue': pred_r}])
+            temp_df = pd.concat([temp_df, new_row_df], ignore_index=True)
+            # update next row's lag features if exists
             if idx+1 < len(X_future):
-                X_future.iloc[idx+1, X_future.columns.get_loc('lag_v_1')] = pred_v
-                X_future.iloc[idx+1, X_future.columns.get_loc('lag_r_1')] = pred_r
-                X_future.iloc[idx+1, X_future.columns.get_loc('lag_v_7')] = temp_df.iloc[-7]['Total_Vehicles'] if len(temp_df)>=7 else temp_df.iloc[0]['Total_Vehicles']
-                X_future.iloc[idx+1, X_future.columns.get_loc('lag_r_7')] = temp_df.iloc[-7]['Total_Revenue'] if len(temp_df)>=7 else temp_df.iloc[0]['Total_Revenue']
-                X_future.iloc[idx+1, X_future.columns.get_loc('rm7_v')] = temp_df['Total_Vehicles'].rolling(window=7,min_periods=1).mean().iloc[-1]
-                X_future.iloc[idx+1, X_future.columns.get_loc('rm7_r')] = temp_df['Total_Revenue'].rolling(window=7,min_periods=1).mean().iloc[-1]
+                # update lag_1 and lag_r_1 with current prediction
+                X_future.at[idx+1, 'lag_v_1'] = pred_v
+                X_future.at[idx+1, 'lag_r_1'] = pred_r
+                # update lag_7 and rm7 using temp_df's last rows
+                if len(temp_df) >= 7:
+                    X_future.at[idx+1, 'lag_v_7'] = temp_df.iloc[-7]['Total_Vehicles']
+                    X_future.at[idx+1, 'lag_r_7'] = temp_df.iloc[-7]['Total_Revenue']
+                else:
+                    X_future.at[idx+1, 'lag_v_7'] = temp_df['Total_Vehicles'].iloc[0]
+                    X_future.at[idx+1, 'lag_r_7'] = temp_df['Total_Revenue'].iloc[0]
+                X_future.at[idx+1, 'rm7_v'] = temp_df['Total_Vehicles'].rolling(window=7,min_periods=1).mean().iloc[-1]
+                X_future.at[idx+1, 'rm7_r'] = temp_df['Total_Revenue'].rolling(window=7,min_periods=1).mean().iloc[-1]
 
         fut_dates = (df['Date'].max() + pd.to_timedelta(np.arange(1, n_days+1), unit='D'))
         result = pd.DataFrame({
             'Date': fut_dates,
-            'Predicted_Total_Vehicles': np.round(fut_preds_v).astype(int),
-            'Predicted_Total_Revenue': np.round(fut_preds_r).astype(int)
+            'Predicted_Total_Vehicles': fut_preds_v,
+            'Predicted_Total_Revenue': fut_preds_r
         })
         st.write(result)
         st.line_chart(result.set_index('Date')['Predicted_Total_Vehicles'])
         st.line_chart(result.set_index('Date')['Predicted_Total_Revenue'])
 
 st.markdown("---")
-st.caption("Model uses XGBoost with time-series features (lags & rolling means). For best results: provide clean historical daily data, include at least 60–90 days history, and consider adding external features (holidays, weather).")
+st.caption("Fixed append issues. Model uses XGBoost with time-series features (lags & rolling means).")
